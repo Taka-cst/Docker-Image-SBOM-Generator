@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Docker SBOM Web GUI</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        body { padding: 1.5rem; }
+        textarea {
+            min-height: 300px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
+        .muted { color: #666; font-size: 0.9rem; }
+        .status { margin-top: 0.5rem; }
+    </style>
+</head>
+<body>
+<main class="container">
+    <h1>Docker SBOM Web GUI</h1>
+    <p>Generate an SBOM for any Docker Hub image using Syft or Trivy. The backend runs the tools and returns results via JSON.</p>
+
+    <form id="sbom-form">
+        <label>
+            Docker image reference
+            <input type="text" id="image_ref" name="image_ref" placeholder="nginx:latest" required>
+        </label>
+
+        <label>
+            Registry username (optional)
+            <input type="text" id="registry_username" name="registry_username" placeholder="registry username">
+        </label>
+
+        <label>
+            Registry password (optional)
+            <input type="password" id="registry_password" name="registry_password" placeholder="registry password">
+        </label>
+
+        <label>
+            SBOM tool
+            <select id="tool" name="tool" required>
+                <option value="syft">Syft</option>
+                <option value="trivy">Trivy</option>
+            </select>
+        </label>
+
+        <label>
+            SBOM format
+            <select id="format" name="format" required>
+                <option value="spdx">SPDX (JSON)</option>
+                <option value="cyclonedx">CycloneDX (JSON)</option>
+            </select>
+        </label>
+
+        <button type="submit">Generate SBOM</button>
+        <p class="status" id="status-text"></p>
+    </form>
+
+    <section id="results" hidden>
+        <h4>Result</h4>
+        <p><strong>Command:</strong> <code id="command-preview"></code></p>
+        <p class="muted" id="cleanup-message"></p>
+        <p class="muted" id="saved-path"></p>
+        <p id="download-link"></p>
+        <textarea readonly id="sbom-output"></textarea>
+    </section>
+
+    <section id="error-box" hidden>
+        <article class="error">
+            <h4>Generation failed</h4>
+            <pre id="error-text"></pre>
+        </article>
+    </section>
+</main>
+
+<script>
+    const form = document.getElementById('sbom-form');
+    const statusText = document.getElementById('status-text');
+    const results = document.getElementById('results');
+    const errorBox = document.getElementById('error-box');
+    const errorText = document.getElementById('error-text');
+    const sbomOutput = document.getElementById('sbom-output');
+    const commandPreview = document.getElementById('command-preview');
+    const downloadLink = document.getElementById('download-link');
+    const cleanupMessage = document.getElementById('cleanup-message');
+    const savedPath = document.getElementById('saved-path');
+
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        results.hidden = true;
+        errorBox.hidden = true;
+        statusText.textContent = 'Pulling image and generating SBOM...';
+
+        const payload = {
+            image_ref: document.getElementById('image_ref').value.trim(),
+            tool: document.getElementById('tool').value,
+            format: document.getElementById('format').value,
+            registry_username: document.getElementById('registry_username').value,
+            registry_password: document.getElementById('registry_password').value,
+        };
+
+        try {
+            const resp = await fetch('/api/sbom', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const rawText = await resp.text();
+            let data = null;
+            try {
+                data = JSON.parse(rawText);
+            } catch (_) {
+                data = null;
+            }
+            if (!resp.ok || !data || !data.success) {
+                const msg = (data && data.error) ? data.error : rawText || `Request failed with status ${resp.status}`;
+                throw new Error(msg);
+            }
+
+            statusText.textContent = 'SBOM generation completed.';
+            results.hidden = false;
+            commandPreview.textContent = data.command || '';
+            cleanupMessage.textContent = data.cleanup_message || '';
+            savedPath.textContent = data.saved_path ? `Saved to: ${data.saved_path}` : '';
+            sbomOutput.value = data.sbom || '';
+
+            if (data.download_token && data.download_filename) {
+                downloadLink.innerHTML = `<a role="button" href="/api/download/${data.download_token}">Download ${data.download_filename}</a>`;
+            } else {
+                downloadLink.textContent = '';
+            }
+        } catch (err) {
+            statusText.textContent = '';
+            errorBox.hidden = false;
+            errorText.textContent = err.message;
+        }
+    });
+</script>
+</body>
+</html>

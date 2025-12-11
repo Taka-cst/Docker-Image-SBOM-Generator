@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Docker SBOM Web GUI</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        body {
+            padding: 1.5rem;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #0f62fe;
+            border-radius: 50%;
+            width: 28px;
+            height: 28px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        textarea {
+            min-height: 300px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
+        .error {
+            color: #b00020;
+        }
+        .command-preview {
+            font-size: 0.9rem;
+            background: #f6f8fa;
+            border-radius: 0.4rem;
+            padding: 0.8rem;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+<main class="container">
+    <h1>Docker SBOM Web GUI</h1>
+    <p>Generate an SBOM for any public Docker Hub image using Syft or Trivy.</p>
+
+    <form method="post" id="sbom-form">
+        <label>
+            Docker image reference
+            <input type="text" name="image_ref" placeholder="e.g. nginx:latest" value="{{ image_value }}" required>
+        </label>
+
+        <label>
+            SBOM tool
+            <select name="tool" required>
+                {% for key, label in tools.items() %}
+                    <option value="{{ key }}" {% if key == selected_tool %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </label>
+
+        <label>
+            SBOM format
+            <select name="format" required>
+                {% for key, config in formats.items() %}
+                    <option value="{{ key }}" {% if key == selected_format %}selected{% endif %}>{{ config.label }}</option>
+                {% endfor %}
+            </select>
+        </label>
+
+        <button type="submit">Generate SBOM</button>
+    </form>
+
+    <div id="progress-box" {% if not progress_message %}hidden{% endif %}>
+        <article>
+            <header>
+                <div class="grid">
+                    <div class="spinner"></div>
+                    <div>
+                        <strong>In progress</strong>
+                        <p id="progress-text">{{ progress_message or "Working..." }}</p>
+                    </div>
+                </div>
+            </header>
+        </article>
+    </div>
+
+    {% if error_message %}
+        <article class="error">
+            <h3>Generation failed</h3>
+            <pre>{{ error_message }}</pre>
+        </article>
+    {% endif %}
+
+    {% if command_preview %}
+        <h4>Executed command</h4>
+        <pre class="command-preview">{{ command_preview }}</pre>
+    {% endif %}
+
+    {% if sbom_output %}
+        <h4>SBOM output</h4>
+        {% if download_filename %}
+            <p>
+                File name: <code>{{ download_filename }}</code><br>
+                {% if download_token %}
+                    <a href="{{ url_for('download', token=download_token) }}" role="button">Download SBOM</a>
+                {% endif %}
+            </p>
+        {% endif %}
+        {% if cleanup_message %}
+            <p><small>{{ cleanup_message }}</small></p>
+        {% endif %}
+        <textarea readonly>{{ sbom_output }}</textarea>
+    {% endif %}
+</main>
+
+<script>
+    const form = document.getElementById('sbom-form');
+    const progressBox = document.getElementById('progress-box');
+    const progressText = document.getElementById('progress-text');
+
+    form.addEventListener('submit', () => {
+        if (progressBox) {
+            progressBox.hidden = false;
+        }
+        if (progressText) {
+            progressText.textContent = 'Pulling from Docker Hub / generating SBOM...';
+        }
+    });
+</script>
+</body>
+</html>
