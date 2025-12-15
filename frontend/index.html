@@ -1104,19 +1104,36 @@
     const progressLabel = document.getElementById('progress-label');
     const progressStatus = document.getElementById('progress-status');
     let progressTimer = null;
+    let progressTotal = null;
 
-    function startProgress(label = '処理中...') {
+    function startProgress(label = '処理中...', total = null) {
         if (progressTimer) clearInterval(progressTimer);
+        progressTotal = total;
         progressPanel.classList.remove('hidden');
         progressLabel.textContent = label;
         progressStatus.textContent = '進行中';
         progressStatus.style.background = 'rgba(11, 210, 196, 0.14)';
-        progressBar.style.width = '10%';
-        let width = 10;
-        progressTimer = setInterval(() => {
-            width = Math.min(width + Math.random() * 7, 92);
-            progressBar.style.width = `${width}%`;
-        }, 220);
+
+        if (total && total > 0) {
+            const base = Math.max(5, Math.min(25, 100 / (total + 1)));
+            progressBar.style.width = `${base}%`;
+        } else {
+            progressBar.style.width = '10%';
+            let width = 10;
+            progressTimer = setInterval(() => {
+                width = Math.min(width + Math.random() * 7, 92);
+                progressBar.style.width = `${width}%`;
+            }, 220);
+        }
+    }
+
+    function updateProgress(completed = 0, total = null, label = '') {
+        if (total !== null && total !== undefined) progressTotal = total;
+        if (label) progressLabel.textContent = label;
+        if (progressTotal && progressTotal > 0) {
+            const pct = Math.max(5, Math.min(100, (completed / progressTotal) * 100));
+            progressBar.style.width = `${pct}%`;
+        }
     }
 
     function finishProgress(ok = true, message = '') {
@@ -1176,6 +1193,109 @@
         });
     }
 
+    function parseSseChunk(chunk) {
+        const lines = chunk.split('\n').filter((line) => line.startsWith('data:'));
+        if (!lines.length) return null;
+        const payload = lines.map((line) => line.replace(/^data:\s*/, '')).join('\n');
+        try {
+            return JSON.parse(payload);
+        } catch (_err) {
+            return null;
+        }
+    }
+
+    async function runZipStream(payload) {
+        startProgress('4 パターン ZIP を生成中...', 4);
+        setSingleStatus('実行中...', null);
+
+        const resp = await fetch('/api/sbom/all/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (!resp.ok || !resp.body) {
+            throw new Error(`HTTP ${resp.status}`);
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        const records = [];
+        let completed = 0;
+        let total = 4;
+        let hadFailures = false;
+        let zipInfo = null;
+        let cleanupMessage = '';
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const parts = buffer.split('\n\n');
+            buffer = parts.pop();
+
+            for (const part of parts) {
+                const evt = parseSseChunk(part);
+                if (!evt) continue;
+                if (typeof evt.total === 'number') total = evt.total || total;
+
+                if (evt.type === 'error') {
+                    throw new Error(evt.error || '失敗しました');
+                }
+
+                if (evt.type === 'prefetch') {
+                    setSingleStatus('キャッシュ確認中...', null);
+                }
+
+                if (evt.type === 'record' && evt.record) {
+                    if (typeof evt.completed === 'number') {
+                        completed = evt.completed;
+                    } else {
+                        completed += 1;
+                    }
+                    records.push(evt.record);
+                    renderRecords(singleRecords, records);
+                    updateProgress(completed, total, `進行中 (${completed}/${total})`);
+                }
+
+                if (evt.type === 'cleanup' && evt.message) {
+                    cleanupMessage = evt.message;
+                }
+
+                if (evt.type === 'zip_ready') {
+                    zipInfo = evt;
+                }
+
+                if (evt.type === 'done') {
+                    hadFailures = !!evt.had_failures;
+                    zipInfo = zipInfo || evt;
+                    if (Array.isArray(evt.records) && evt.records.length) {
+                        records.length = 0;
+                        records.push(...evt.records);
+                        renderRecords(singleRecords, records);
+                    }
+                }
+            }
+        }
+
+        if (buffer.trim()) {
+            const evt = parseSseChunk(buffer);
+            if (evt && evt.type === 'done') {
+                hadFailures = !!evt.had_failures;
+                zipInfo = zipInfo || evt;
+            }
+        }
+
+        if (zipInfo && zipInfo.zip_token && zipInfo.zip_filename) {
+            singleZipDownload.innerHTML = `<a role="button" href="/api/download/${zipInfo.zip_token}">ZIP をダウンロード (${zipInfo.zip_filename})</a>`;
+            singleSaved.textContent = zipInfo.zip_saved_path ? `保存先: ${zipInfo.zip_saved_path}` : '';
+        }
+        singleCleanup.textContent = cleanupMessage || '';
+        const ok = !hadFailures;
+        setSingleStatus(ok ? '完了' : '完了（一部失敗あり）', ok ? 'success' : null);
+        finishProgress(ok);
+    }
+
     async function runSingle(mode) {
         const imageRef = document.getElementById('single-image').value.trim();
         const tool = document.getElementById('single-tool').value;
@@ -1196,18 +1316,27 @@
             return;
         }
 
+        const payload = { image_ref: imageRef, registry_username, registry_password };
         const isZip = mode === 'zip';
-        startProgress(isZip ? '4 パターン ZIP を生成中...' : 'SBOM を生成中...');
         setSingleStatus('実行中...', null);
 
-        const payload = { image_ref: imageRef, registry_username, registry_password };
-        let endpoint = '/api/sbom';
-        if (!isZip) {
-            payload.tool = tool;
-            payload.format = format;
-        } else {
-            endpoint = '/api/sbom/all';
+        if (isZip) {
+            try {
+                await runZipStream(payload);
+                return;
+            } catch (err) {
+                setSingleStatus('失敗しました', 'error');
+                singleError.style.display = 'block';
+                singleError.textContent = err.message;
+                finishProgress(false, '失敗');
+                return;
+            }
         }
+
+        startProgress('SBOM を生成中...');
+        payload.tool = tool;
+        payload.format = format;
+        const endpoint = '/api/sbom';
 
         try {
             const resp = await fetch(endpoint, {
@@ -1221,25 +1350,14 @@
                 throw new Error(msg);
             }
 
-            if (isZip) {
-                singleOutput.value = '';
-                renderRecords(singleRecords, data.records || []);
-                if (data.zip_download_token && data.zip_filename) {
-                    singleZipDownload.innerHTML = `<a role="button" href="/api/download/${data.zip_download_token}">ZIP をダウンロード (${data.zip_filename})</a>`;
-                }
-                const partial = data.had_failures;
-                setSingleStatus(partial ? '完了（一部失敗あり）' : '完了', partial ? null : 'success');
-                finishProgress(!partial);
-            } else {
-                singleOutput.value = data.sbom || '';
-                singleCleanup.textContent = data.cleanup_message || '';
-                singleSaved.textContent = data.saved_path ? `保存先: ${data.saved_path}` : '';
-                if (data.download_token && data.download_filename) {
-                    singleDownload.innerHTML = `<a role="button" href="/api/download/${data.download_token}">ダウンロード (${data.download_filename})</a>`;
-                }
-                setSingleStatus('完了', 'success');
-                finishProgress(true);
+            singleOutput.value = data.sbom || '';
+            singleCleanup.textContent = data.cleanup_message || '';
+            singleSaved.textContent = data.saved_path ? `保存先: ${data.saved_path}` : '';
+            if (data.download_token && data.download_filename) {
+                singleDownload.innerHTML = `<a role="button" href="/api/download/${data.download_token}">ダウンロード (${data.download_filename})</a>`;
             }
+            setSingleStatus('完了', 'success');
+            finishProgress(true);
         } catch (err) {
             setSingleStatus('失敗しました', 'error');
             singleError.style.display = 'block';

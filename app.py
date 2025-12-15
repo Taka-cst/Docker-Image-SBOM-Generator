@@ -1,5 +1,6 @@
 import collections
 import io
+import json
 import os
 import re
 import shlex
@@ -7,9 +8,10 @@ import subprocess
 import threading
 import uuid
 import zipfile
-from typing import Any, Dict, List, Tuple
+from queue import SimpleQueue
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from flask import Flask, abort, jsonify, request, send_file
+from flask import Flask, Response, abort, jsonify, request, send_file
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "sbom-web-secret")
@@ -63,7 +65,7 @@ def _humanize_error(raw: str) -> str:
     return raw
 
 
-def _build_command(tool: str, image: str, sbom_format: str) -> List[str]:
+def _build_command(tool: str, image: str, sbom_format: str, prefer_local: bool = False) -> List[str]:
     """Create the CLI command for the requested tool/format combination."""
     if tool not in SUPPORTED_TOOLS:
         raise ValueError(f"Unsupported tool: {tool}")
@@ -75,15 +77,20 @@ def _build_command(tool: str, image: str, sbom_format: str) -> List[str]:
         return ["syft", image, "-o", output_flag]
 
     format_flag = SUPPORTED_FORMATS[sbom_format][tool]
-    # Trivy: generate SBOM via image scan from remote registry (container cannot access host Docker daemon).
-    return [
+    command = [
         "trivy",
         "image",
         "--format",
         format_flag,
-        "--image-src=remote",
-        image,
     ]
+    # Prefer local daemon when available to avoid repeated remote pulls during bulk ZIP generation.
+    if prefer_local:
+        command.append("--image-src=auto")
+    else:
+        command.append("--image-src=remote")
+
+    command.append(image)
+    return command
 
 
 def _build_filename(image_ref: str, tool: str, sbom_format: str) -> str:
@@ -192,31 +199,37 @@ def _build_env(registry_username: str = "", registry_password: str = "") -> Dict
     return env
 
 
-def _ensure_image_cached(image_ref: str, extra_env: Dict[str, str] | None = None) -> str:
-    """Best-effort: avoid repeated pulls by checking local cache; pull if missing.
-    
-    Note: When running inside a container without Docker socket access, this will
-    quickly return as Docker CLI won't be able to connect to the daemon.
-    """
+def _docker_available(extra_env: Dict[str, str] | None = None) -> bool:
+    """Check whether Docker daemon is reachable; keeps timeout very short."""
     env = _build_env(**(extra_env or {}))
-    
-    # Quick check: if docker command doesn't exist, skip immediately
-    inspect_cmd = ["docker", "version"]
+    inspect_cmd = ["docker", "version", "--format", "{{.Server.Version}}"]
     try:
-        version_check = subprocess.run(
+        completed = subprocess.run(
             inspect_cmd,
             capture_output=True,
             text=True,
             check=False,
-            timeout=5,  # Very short timeout for version check
+            timeout=5,
             env=env,
         )
-        if version_check.returncode != 0:
-            return "Docker daemon not accessible; tool will fetch image directly."
     except FileNotFoundError:
-        return "Docker CLI not available; tool will fetch image directly."
+        return False
     except subprocess.TimeoutExpired:
-        return "Docker not responding; tool will fetch image directly."
+        return False
+
+    return completed.returncode == 0
+
+
+def _ensure_image_cached(image_ref: str, extra_env: Dict[str, str] | None = None) -> str:
+    """Best-effort: avoid repeated pulls by checking local cache; pull if missing.
+
+    Note: When running inside a container without Docker socket access, this will
+    quickly return as Docker CLI won't be able to connect to the daemon.
+    """
+    env = _build_env(**(extra_env or {}))
+
+    if not _docker_available(extra_env):
+        return "Docker daemon not accessible; tool will fetch image directly."
 
     # Docker is available, check if image exists
     inspect_cmd = ["docker", "image", "inspect", image_ref]
@@ -321,14 +334,20 @@ def _run_command(command: List[str], extra_env: Dict[str, str] | None = None) ->
 
 
 def _generate_bulk_sboms(
-    image_entries: List[Dict[str, Any]], registry_username: str = "", registry_password: str = ""
+    image_entries: List[Dict[str, Any]],
+    registry_username: str = "",
+    registry_password: str = "",
+    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Generate SBOMs for multiple images (Syft/Trivy x SPDX/CycloneDX) and bundle them as a ZIP."""
     combinations = [(tool, sbom_format) for tool in SUPPORTED_TOOLS for sbom_format in SUPPORTED_FORMATS]
+    total = len(image_entries) * len(combinations)
+    completed = 0
     results: List[Dict[str, Any]] = []
     zip_buffer = io.BytesIO()
     had_failure = False
     auth_kwargs = {"registry_username": registry_username, "registry_password": registry_password}
+    prefer_local = _docker_available(auth_kwargs)
 
     with zipfile.ZipFile(zip_buffer, mode="w", compression=ZIP_COMPRESSION) as zip_file:
         for entry in image_entries:
@@ -337,9 +356,31 @@ def _generate_bulk_sboms(
             prefetch_note = _ensure_image_cached(image_ref, {"registry_username": registry_username, "registry_password": registry_password})
             app.logger.info("Prefetch result for %s: %s", image_ref, prefetch_note)
             entry["prefetch"] = prefetch_note
+            if progress_cb:
+                progress_cb(
+                    {
+                        "type": "prefetch",
+                        "image_ref": image_ref,
+                        "message": prefetch_note,
+                        "completed": completed,
+                        "total": total,
+                    }
+                )
 
             for tool, sbom_format in combinations:
-                command = _build_command(tool, image_ref, sbom_format)
+                if progress_cb:
+                    progress_cb(
+                        {
+                            "type": "start",
+                            "image_ref": image_ref,
+                            "tool": tool,
+                            "format": sbom_format,
+                            "completed": completed,
+                            "total": total,
+                        }
+                    )
+
+                command = _build_command(tool, image_ref, sbom_format, prefer_local=prefer_local)
                 command_preview = " ".join(shlex.quote(token) for token in command)
                 success, output_or_error = _run_command(command, extra_env=auth_kwargs)
                 record: Dict[str, Any] = {
@@ -364,14 +405,47 @@ def _generate_bulk_sboms(
                     zip_file.writestr(f"errors/{folder}-{tool}-{sbom_format}.txt", friendly)
 
                 results.append(record)
+                completed += 1
+                if progress_cb:
+                    progress_cb(
+                        {
+                            "type": "record",
+                            "record": record,
+                            "completed": completed,
+                            "total": total,
+                        }
+                    )
 
             entry["cleanup_message"] = _cleanup_image(image_ref)
+            if progress_cb:
+                progress_cb(
+                    {
+                        "type": "cleanup",
+                        "image_ref": image_ref,
+                        "message": entry["cleanup_message"],
+                        "completed": completed,
+                        "total": total,
+                    }
+                )
 
     zip_buffer.seek(0)
     zip_bytes = zip_buffer.getvalue()
     zip_filename = f"sboms-batch-{uuid.uuid4().hex}.zip"
     zip_token = _cache_download(zip_bytes, zip_filename, mimetype="application/zip")
     zip_saved_path = _write_bytes_to_disk(zip_bytes, zip_filename)
+
+    if progress_cb:
+        progress_cb(
+            {
+                "type": "zip_ready",
+                "zip_token": zip_token,
+                "zip_filename": zip_filename,
+                "zip_saved_path": zip_saved_path,
+                "completed": completed,
+                "total": total,
+                "had_failures": had_failure,
+            }
+        )
 
     return {
         "success": True,
@@ -421,6 +495,69 @@ def api_sbom_all():
     )
 
 
+@app.route("/api/sbom/all/stream", methods=["POST"])
+def api_sbom_all_stream():
+    """Stream progress for the 4-pattern ZIP generation using SSE-style events."""
+    payload = request.get_json(silent=True) or {}
+    image_ref = (payload.get("image_ref") or "").strip()
+    registry_username = payload.get("registry_username") or ""
+    registry_password = payload.get("registry_password") or ""
+
+    if not image_ref:
+        return (
+            jsonify({"success": False, "error": "Docker image reference is required (example: nginx:latest)."}),
+            400,
+        )
+
+    try:
+        entry = _prepare_single_entry(image_ref)
+    except Exception as exc:  # noqa: BLE001 - return friendly message
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    def stream_events():
+        q: SimpleQueue = SimpleQueue()
+        sentinel = object()
+
+        def push(event: Dict[str, Any]):
+            event.setdefault("image_ref", image_ref)
+            q.put(event)
+
+        def worker():
+            try:
+                result = _generate_bulk_sboms(
+                    [entry],
+                    registry_username=registry_username,
+                    registry_password=registry_password,
+                    progress_cb=push,
+                )
+                push(
+                    {
+                        "type": "done",
+                        "success": True,
+                        "had_failures": result.get("had_failures", False),
+                        "zip_token": result.get("zip_token"),
+                        "zip_filename": result.get("zip_filename"),
+                        "zip_saved_path": result.get("zip_saved_path"),
+                        "records": result.get("records", []),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - stream friendly error
+                push({"type": "error", "success": False, "error": str(exc)})
+            finally:
+                q.put(sentinel)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            item = q.get()
+            if item is sentinel:
+                break
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return Response(stream_events(), content_type="text/event-stream", headers=headers)
+
+
 @app.route("/api/sbom", methods=["POST"])
 def api_sbom():
     payload = request.get_json(silent=True) or {}
@@ -435,12 +572,16 @@ def api_sbom():
     if selected_format not in SUPPORTED_FORMATS:
         return jsonify({"success": False, "error": "Invalid SBOM format selection."}), 400
 
-    command = _build_command(selected_tool, image_ref, selected_format)
-    command_preview = " ".join(shlex.quote(token) for token in command)
     registry_username = payload.get("registry_username") or ""
     registry_password = payload.get("registry_password") or ""
     env_kwargs = {"registry_username": registry_username, "registry_password": registry_password}
+    prefer_local = _docker_available(env_kwargs)
+    if prefer_local:
+        prefetch_note = _ensure_image_cached(image_ref, env_kwargs)
+        app.logger.info("Prefetch result for %s: %s", image_ref, prefetch_note)
 
+    command = _build_command(selected_tool, image_ref, selected_format, prefer_local=prefer_local)
+    command_preview = " ".join(shlex.quote(token) for token in command)
     success, output_or_error = _run_command(command, extra_env=env_kwargs)
     if not success:
         return jsonify({"success": False, "error": _friendly_error(output_or_error), "command": command_preview}), 500
