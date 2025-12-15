@@ -1,36 +1,32 @@
 # Docker SBOM Web GUI
 
-Docker Hub のイメージを対象に、Syft または Trivy を使って SPDX / CycloneDX 形式の SBOM を生成するシンプルな Web GUI です。ブラウザからイメージ名を入力して SBOM を取得でき、実行したコマンドも併せて確認できます。
+Syft / Trivy を使って SPDX / CycloneDX 形式の SBOM を生成するシンプルな Web GUI です。ブラウザからイメージ名を入力するだけで SBOM を取得でき、実行したコマンドも確認できます。現在は「単体生成」と「4 パターン ZIP」に絞って動作します。
 
-## 主な特徴
-- Syft または Trivy を選択して SBOM を生成
-- SPDX(JSON) / CycloneDX(JSON) の両フォーマットに対応
-- Web フォームからイメージ参照を入力するだけで実行
-- 実行したコマンドを表示し、CLI での再現を容易に
-- Docker イメージとして配布・実行可能
+## 特長
+- Syft または Trivy を選んで SBOM を生成（SPDX JSON / CycloneDX JSON 対応）。
+- フロントエンドからイメージ参照を入力するだけで利用可能。
+- 実行コマンドを表示し、CLI での再現が容易。
+- 単体イメージでも 4 パターン（Syft/Trivy × SPDX/CycloneDX）を一括 ZIP でダウンロード可能。
+- Docker コンテナとして実行できるため、ローカルに Syft/Trivy を用意しなくても試せます。
 
 ## 前提
-- Docker 環境 (推奨)
-- もしくはローカルで動かす場合: Python 3.11 以上、`syft` と `trivy` コマンドが PATH に存在すること
+- Docker 環境（推奨）。  
+  またはローカル実行の場合は Python 3.11 以降と、`syft` と `trivy` が PATH にあること。
 
-## アーキテクチャ
-- **backend**: Flask API (`/api/sbom`, `/api/download/<token>`) で Syft/Trivy を実行し、生成した SBOM を `/tmp/sboms` に保存してパスをログ出力します。
-- **frontend**: Nginx が静的 HTML/JS を配信し、`/api/*` を backend にプロキシします。
-
-## クイックスタート (docker-compose)
+## クイックスタート（docker-compose）
 ```bash
 docker-compose up -d --build
 ```
-ブラウザで `http://localhost:8080` を開き、イメージ名・ツール・フォーマットを選んで実行します。停止は `docker-compose down`。
+ブラウザで `http://localhost:8080` を開きます。停止は `docker-compose down` です。
 
-## 単体実行 (backend を直接起動する場合)
+## backend だけを起動する場合
 ```bash
 docker build -t sbom-backend .
 docker run --rm -p 8080:8080 sbom-backend
 ```
-API は `POST /api/sbom` に JSON で `image_ref`, `tool`, `format` を渡します。
+この場合は別途フロントエンドを用意するか、`POST /api/sbom` に JSON で `image_ref`, `tool`, `format` を送信してください。
 
-## ローカル実行 (開発用)
+## ローカル開発の例
 ```bash
 python -m venv .venv
 . .venv/bin/activate  # Windows: .venv\Scripts\activate
@@ -40,37 +36,34 @@ pip install -r requirements.txt
 FLASK_APP=app.py flask run --port 8080
 ```
 
-## 使い方
-1) Docker イメージ参照を入力 (例: `nginx:latest` または `library/nginx:1.25`).  
-2) ツールを選択 (Syft / Trivy).  
-3) フォーマットを選択 (SPDX JSON / CycloneDX JSON).  
-4) 「Generate SBOM」をクリックすると、SBOM 出力と実行コマンドが表示されます。
+## 使い方（フロントエンド）
+- 単体生成: イメージ名を入れ、ツールとフォーマットを選んで「SBOM を生成」を押すと結果とダウンロードリンクが表示されます。
+- 4 パターン ZIP: イメージ名（必要なら認証情報）を入れ、「4 パターン ZIP」を押すと Syft/Trivy × SPDX/CycloneDX の 4 つをまとめて取得できます。
 
-## 環境変数
-- `PORT` — アプリの待受ポート (デフォルト `8080`)
-- `FLASK_SECRET` — セッション用シークレットキー
-- `SBOM_GENERATION_TIMEOUT` — SBOM 生成のタイムアウト秒 (デフォルト 600)
-- `TRIVY_SKIP_DB_UPDATE` — Trivy の DB 更新スキップ (Dockerfile では `true` 設定)
-- `TRIVY_NO_PROGRESS` — Trivy のプログレス非表示
-- `DELETE_IMAGE_AFTER_SUCCESS` — 成功時に `docker image rm -f <image>` を実行してイメージを掃除 (デフォルト: 無効)。Docker CLI が使えない環境では自動スキップ。
-- `SBOM_OUTPUT_DIR` — SBOM を保存するディレクトリ (デフォルト `/tmp/sboms`, docker-compose ではボリュームにマウント)
-- `SYFT_REGISTRY_AUTH_USERNAME` / `SYFT_REGISTRY_AUTH_PASSWORD`, `TRIVY_USERNAME` / `TRIVY_PASSWORD` — プライベートレジストリ用の認証情報（フロントからも入力可能）
-- nginx のタイムアウト: `frontend/nginx.conf` で `/api/` への `proxy_read_timeout` などを 600s に延長済み。長時間かかる SBOM 生成に対応。
+## API 一覧
+- `POST /api/sbom`  
+  body: `{"image_ref": "...", "tool": "syft|trivy", "format": "spdx|cyclonedx", "registry_username": "...", "registry_password": "..."}`  
+  response: `{success, command, sbom, download_token, download_filename, saved_path, cleanup_message}`
+- `POST /api/sbom/all`  
+  body: `{"image_ref": "...", "registry_username": "...", "registry_password": "..."}`  
+  単体イメージに対して 4 パターン（Syft/Trivy × SPDX/CycloneDX）を生成し、ZIP を返却。response には `zip_download_token`, `zip_filename`, `records` などが含まれます。
+- `GET /api/download/<token>`  
+  生成済み（キャッシュ済み）の SBOM または ZIP をダウンロード。
 
-## 仕組み (概要)
-`app.py` が Flask でフォームを受け取り、選択されたツール・フォーマットに応じて以下を実行します。
-- Syft: `syft <image> -o spdx-json|cyclonedx-json`
-- Trivy: `trivy sbom --format spdx-json|cyclonedx <image>`
-標準出力をそのまま Web 上に表示し、失敗時はエラー内容を返します。
+## 主な環境変数
+- `PORT`: リッスンポート（デフォルト 8080）
+- `SBOM_OUTPUT_DIR`: SBOM 保存先（デフォルト `/tmp/sboms`）
+- `DELETE_IMAGE_AFTER_SUCCESS`: 成功後に `docker image rm -f <image>` を実行（デフォルト無効）
+- `SBOM_GENERATION_TIMEOUT`: タイムアウト秒数（デフォルト 600）
+- `TRIVY_SKIP_DB_UPDATE`: Trivy DB 更新スキップ（デフォルト true）
+- `TRIVY_NO_PROGRESS`: Trivy のプログレス非表示
+- `SYFT_REGISTRY_AUTH_USERNAME` / `SYFT_REGISTRY_AUTH_PASSWORD`
+- `TRIVY_USERNAME` / `TRIVY_PASSWORD`
+- `FLASK_SECRET`: セッション用シークレット
 
 ## よくあるポイント
-- Docker Hub のプライベートイメージを扱う場合は、コンテナを起動するホストで `docker login` 済みであることを確認してください。
-- 大きなイメージでは生成に時間がかかることがあります。`SBOM_GENERATION_TIMEOUT` を調整してください。
-- Trivy で脆弱性 DB の更新が必要な場合は、`TRIVY_SKIP_DB_UPDATE=false` を設定し、ネットワーク接続を許可してください。
+- 大きなイメージは時間がかかるため、`SBOM_GENERATION_TIMEOUT` を調整してください。
+- プライベートイメージを扱う場合、ホストで `docker login` を済ませ、必要に応じて `~/.docker/config.json` を backend コンテナにマウントしてください。
+- Trivy の DB 更新が必要な場合は `TRIVY_SKIP_DB_UPDATE=false` にし、ネットワーク接続を許可してください。
 
-## 追加ドキュメント
-- 詳細な手順: `docs/USAGE.md`
-- トラブルシューティング: `docs/TROUBLESHOOTING.md`
-
-## ライセンス
-プロジェクトのライセンス方針に合わせて適宜追加してください。
+より詳細な手順は `docs/USAGE.md` を参照してください。
