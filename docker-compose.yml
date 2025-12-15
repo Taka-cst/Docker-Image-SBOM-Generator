@@ -7,12 +7,18 @@ services:
       dockerfile: Dockerfile
     environment:
       PORT: "8080"
+      TRIVY_SKIP_POLICY_UPDATE: "true"
       TRIVY_SKIP_DB_UPDATE: "true"
       TRIVY_NO_PROGRESS: "true"
+      TRIVY_DISABLE_TELEMETRY: "true"
+      TRIVY_CACHE_DIR: "/tmp/trivy-cache"
       SBOM_OUTPUT_DIR: "/tmp/sboms"
       # DELETE_IMAGE_AFTER_SUCCESS: "true"  # enable if you want images removed after SBOM
     volumes:
       - sbom-output:/tmp/sboms
+      - trivy-cache:/tmp/trivy-cache
+      # Uncomment if the Docker socket is available on the host for faster pulls/caching
+      # - /var/run/docker.sock:/var/run/docker.sock
     expose:
       - "8080"
     restart: unless-stopped
@@ -29,3 +35,4 @@ services:
 
 volumes:
   sbom-output:
+  trivy-cache:

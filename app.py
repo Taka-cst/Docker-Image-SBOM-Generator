@@ -20,6 +20,10 @@ DELETE_IMAGE_AFTER_SUCCESS = os.environ.get("DELETE_IMAGE_AFTER_SUCCESS", "false
 }
 SBOM_OUTPUT_DIR = os.environ.get("SBOM_OUTPUT_DIR", "/tmp/sboms")
 ZIP_COMPRESSION = zipfile.ZIP_DEFLATED if hasattr(zipfile, "ZIP_DEFLATED") else zipfile.ZIP_STORED
+TRIVY_SKIP_DB_UPDATE_DEFAULT = os.environ.get("TRIVY_SKIP_DB_UPDATE", "true")
+TRIVY_SKIP_POLICY_UPDATE_DEFAULT = os.environ.get("TRIVY_SKIP_POLICY_UPDATE", "true")
+TRIVY_NO_PROGRESS_DEFAULT = os.environ.get("TRIVY_NO_PROGRESS", "true")
+TRIVY_DISABLE_TELEMETRY_DEFAULT = os.environ.get("TRIVY_DISABLE_TELEMETRY", "true")
 app.config["PROPAGATE_EXCEPTIONS"] = False
 
 
@@ -174,6 +178,11 @@ def _prepare_single_entry(image_ref: str) -> Dict[str, Any]:
 def _build_env(registry_username: str = "", registry_password: str = "") -> Dict[str, str]:
     """Build environment for registry auth if provided."""
     env = os.environ.copy()
+    # Avoid per-run Trivy DB/telemetry overhead for multi-pattern generation unless explicitly overridden.
+    env.setdefault("TRIVY_SKIP_DB_UPDATE", TRIVY_SKIP_DB_UPDATE_DEFAULT)
+    env.setdefault("TRIVY_SKIP_POLICY_UPDATE", TRIVY_SKIP_POLICY_UPDATE_DEFAULT)
+    env.setdefault("TRIVY_NO_PROGRESS", TRIVY_NO_PROGRESS_DEFAULT)
+    env.setdefault("TRIVY_DISABLE_TELEMETRY", TRIVY_DISABLE_TELEMETRY_DEFAULT)
     if registry_username:
         env["SYFT_REGISTRY_AUTH_USERNAME"] = registry_username
         env["TRIVY_USERNAME"] = registry_username
